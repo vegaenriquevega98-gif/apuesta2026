@@ -8,6 +8,8 @@ from google import genai
 
 st.set_page_config(page_title="Football Historical Analytics", layout="wide")
 
+MODELO_GEMINI = "gemini-3.8-flash"
+
 LIGAS = {
     "Premier League (Inglaterra)": "E0",
     "LaLiga (España)": "SP1",
@@ -264,7 +266,7 @@ with tab4:
             with st.spinner("Analizando métricas de Poisson y rachas..."):
                 try:
                     resp = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model=MODELO_GEMINI,
                         contents=f"{contexto_sistema}\n\nSolicitud del usuario: {prompt_diagnostico}",
                     )
                     st.session_state["mensajes_ia"].append({"role": "assistant", "content": resp.text})
@@ -288,7 +290,7 @@ with tab4:
                             [f"{m['role'].upper()}: {m['content']}" for m in st.session_state["mensajes_ia"]]
                         )
                         resp = client.models.generate_content(
-                            model="gemini-2.5-flash",
+                            model=MODELO_GEMINI,
                             contents=f"{contexto_sistema}\n\nConversación previa:\n{historial_chat}",
                         )
                         st.markdown(resp.text)
