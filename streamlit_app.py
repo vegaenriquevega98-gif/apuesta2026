@@ -1,6 +1,7 @@
 import math
 import time
 import difflib
+import unicodedata
 from datetime import datetime, timezone, timedelta
 import requests
 import streamlit as st
@@ -16,11 +17,29 @@ MODELO_GEMINI_DEFAULT = "gemini-3.8-flash"
 ZONA_HORARIA_LOCAL = timezone(timedelta(hours=-4))  # Hora Venezuela (UTC-4)
 
 LIGAS = {
-    "Premier League (Inglaterra)": {"csv": "E0", "espn": "eng.1"},
-    "LaLiga (España)": {"csv": "SP1", "espn": "esp.1"},
-    "Serie A (Italia)": {"csv": "I1", "espn": "ita.1"},
-    "Bundesliga (Alemania)": {"csv": "D1", "espn": "ger.1"},
-    "Ligue 1 (Francia)": {"csv": "F1", "espn": "fra.1"},
+    # --- TOP 5 EUROPA ---
+    "Premier League (Inglaterra)": {"tipo": "eu", "csv": "E0", "espn": "eng.1"},
+    "LaLiga (España)": {"tipo": "eu", "csv": "SP1", "espn": "esp.1"},
+    "Serie A (Italia)": {"tipo": "eu", "csv": "I1", "espn": "ita.1"},
+    "Bundesliga (Alemania)": {"tipo": "eu", "csv": "D1", "espn": "ger.1"},
+    "Ligue 1 (Francia)": {"tipo": "eu", "csv": "F1", "espn": "fra.1"},
+    # --- OTRAS LIGAS EUROPEAS ---
+    "Eredivisie (Países Bajos)": {"tipo": "eu", "csv": "N1", "espn": "ned.1"},
+    "Primeira Liga (Portugal)": {"tipo": "eu", "csv": "P1", "espn": "por.1"},
+    "Jupiler Pro League (Bélgica)": {"tipo": "eu", "csv": "B1", "espn": "bel.1"},
+    "Süper Lig (Turquía)": {"tipo": "eu", "csv": "T1", "espn": "tur.1"},
+    "Scottish Premiership (Escocia)": {"tipo": "eu", "csv": "SC0", "espn": "sco.1"},
+    "Super League (Grecia)": {"tipo": "eu", "csv": "G1", "espn": "gre.1"},
+    # --- SEGUNDAS DIVISIONES EUROPA ---
+    "Championship (Inglaterra 2ª)": {"tipo": "eu", "csv": "E1", "espn": "eng.2"},
+    "LaLiga 2 (España 2ª)": {"tipo": "eu", "csv": "SP2", "espn": "esp.2"},
+    "Serie B (Italia 2ª)": {"tipo": "eu", "csv": "I2", "espn": "ita.2"},
+    "2. Bundesliga (Alemania 2ª)": {"tipo": "eu", "csv": "D2", "espn": "ger.2"},
+    # --- AMÉRICA ---
+    "Brasileirão Serie A (Brasil)": {"tipo": "new", "csv": "BRA", "espn": "bra.1"},
+    "Liga Profesional (Argentina)": {"tipo": "new", "csv": "ARG", "espn": "arg.1"},
+    "Liga MX (México)": {"tipo": "new", "csv": "MEX", "espn": "mex.1"},
+    "MLS (Estados Unidos)": {"tipo": "new", "csv": "USA", "espn": "usa.1"},
 }
 
 TEMPORADAS = {
@@ -32,6 +51,7 @@ TEMPORADAS = {
 }
 
 ALIASES_EQUIPOS = {
+    # Inglaterra
     "manchester city": "Man City",
     "manchester united": "Man United",
     "nottingham forest": "Nott'm Forest",
@@ -42,7 +62,12 @@ ALIASES_EQUIPOS = {
     "brighton & hove albion": "Brighton",
     "leicester city": "Leicester",
     "ipswich town": "Ipswich",
-    "atlético madrid": "Ath Madrid",
+    "sheffield united": "Sheffield United",
+    "leeds united": "Leeds",
+    "west bromwich albion": "West Brom",
+    "queens park rangers": "QPR",
+    "blackburn rovers": "Blackburn",
+    # España
     "atletico madrid": "Ath Madrid",
     "athletic club": "Ath Bilbao",
     "athletic bilbao": "Ath Bilbao",
@@ -50,30 +75,67 @@ ALIASES_EQUIPOS = {
     "real betis": "Betis",
     "rayo vallecano": "Vallecano",
     "celta vigo": "Celta",
-    "deportivo alavés": "Alaves",
     "deportivo alaves": "Alaves",
     "rcd espanyol": "Espanol",
+    "sporting gijon": "Sp Gijon",
+    "real zaragoza": "Zaragoza",
+    "real oviedo": "Oviedo",
+    # Italia
     "internazionale": "Inter",
     "inter milan": "Inter",
     "ac milan": "Milan",
     "as roma": "Roma",
     "hellas verona": "Verona",
+    # Alemania
     "bayern munich": "Bayern Munich",
     "bayer leverkusen": "Leverkusen",
     "borussia dortmund": "Dortmund",
-    "borussia mönchengladbach": "M'gladbach",
     "borussia monchengladbach": "M'gladbach",
     "eintracht frankfurt": "Ein Frankfurt",
     "vfb stuttgart": "Stuttgart",
     "sc freiburg": "Freiburg",
+    "hamburger sv": "Hamburg",
+    "fortuna dusseldorf": "Fortuna Dusseldorf",
+    # Francia / Países Bajos / Portugal / Turquía
     "paris saint-germain": "Paris SG",
     "as monaco": "Monaco",
     "olympique marseille": "Marseille",
     "olympique lyonnais": "Lyon",
     "stade rennais": "Rennes",
-    "as saint-étienne": "St Etienne",
     "as saint-etienne": "St Etienne",
+    "psv eindhoven": "PSV",
+    "feyenoord rotterdam": "Feyenoord",
+    "az alkmaar": "AZ Alkmaar",
+    "fc twente": "Twente",
+    "sporting cp": "Sp Lisbon",
+    "sporting lisbon": "Sp Lisbon",
+    "sl benfica": "Benfica",
+    "fc porto": "Porto",
+    "sc braga": "Sp Braga",
+    "vitoria guimaraes": "Guimaraes",
+    "besiktas": "Besiktas",
+    "fenerbahce": "Fenerbahce",
+    "galatasaray": "Galatasaray",
+    # América (Brasil / Argentina / México / MLS)
+    "atletico mineiro": "Atletico-MG",
+    "athletico paranaense": "Athletico-PR",
+    "sao paulo": "Sao Paulo",
+    "vasco da gama": "Vasco",
+    "red bull bragantino": "Bragantino",
+    "club america": "Club America",
+    "guadalajara": "Guadalajara Chivas",
+    "chivas guadalajara": "Guadalajara Chivas",
+    "tigres uanl": "Tigres",
+    "pumas unam": "U.N.A.M.- Pumas",
+    "inter miami cf": "Inter Miami",
+    "lafc": "Los Angeles FC",
+    "la galaxy": "Los Angeles Galaxy",
 }
+
+
+def normalizar_texto(texto: str) -> str:
+    sin_acentos = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("utf-8")
+    return sin_acentos.strip().lower()
 
 
 def poisson_pmf(k: int, lam: float) -> float:
@@ -108,7 +170,6 @@ def generar_dictamen_local(
     ult_local: pd.DataFrame,
     ult_visita: pd.DataFrame,
 ) -> str:
-    """Motor cuantitativo de respaldo cuando la API externa devuelve 503."""
     def cuota(p: float) -> str:
         return f"{1/p:.2f}" if p > 0.01 else "N/A"
 
@@ -117,33 +178,31 @@ def generar_dictamen_local(
     marcador_top = f"{idx_top[0]}-{idx_top[1]} ({matriz[idx_top]*100:.1f}%)"
 
     candidatos_principales = [
-        (f"Victoria Local ({local})", m["p1"], "resultado"),
-        (f"Victoria Visitante ({visita})", m["p2"], "resultado"),
-        ("Más de 2.5 Goles (Over 2.5)", m["over25"], "goles"),
-        ("Menos de 2.5 Goles (Under 2.5)", m["under25"], "goles"),
-        ("Ambos Equipos Marcan (BTTS Sí)", m["btts"], "goles"),
+        (f"Victoria Local ({local})", m["p1"]),
+        (f"Victoria Visitante ({visita})", m["p2"]),
+        ("Más de 2.5 Goles (Over 2.5)", m["over25"]),
+        ("Menos de 2.5 Goles (Under 2.5)", m["under25"]),
+        ("Ambos Equipos Marcan (BTTS Sí)", m["btts"]),
     ]
-    # Si ningún 1X2 supera 55%, incluir Doble Oportunidad como candidato principal
     if max(m["p1"], m["p2"]) < 0.55:
         candidatos_principales.extend([
-            (f"Doble Oportunidad 1X ({local} o Empate)", m["p1x"], "resultado"),
-            (f"Doble Oportunidad X2 (Empate o {visita})", m["px2"], "resultado"),
+            (f"Doble Oportunidad 1X ({local} o Empate)", m["p1x"]),
+            (f"Doble Oportunidad X2 (Empate o {visita})", m["px2"]),
         ])
 
     candidatos_principales.sort(key=lambda x: x[1], reverse=True)
-    pick_nombre, pick_prob, pick_tipo = candidatos_principales[0]
+    pick_nombre, pick_prob = candidatos_principales[0]
 
     respaldos = [
-        (f"Doble Oportunidad 1X ({local} o Empate)", m["p1x"], "resultado"),
-        (f"Doble Oportunidad X2 (Empate o {visita})", m["px2"], "resultado"),
-        ("Más de 1.5 Goles (Over 1.5)", m["over15"], "goles"),
-        ("Menos de 3.5 Goles (Under 3.5)", m["under35"], "goles"),
+        (f"Doble Oportunidad 1X ({local} o Empate)", m["p1x"]),
+        (f"Doble Oportunidad X2 (Empate o {visita})", m["px2"]),
+        ("Más de 1.5 Goles (Over 1.5)", m["over15"]),
+        ("Menos de 3.5 Goles (Under 3.5)", m["under35"]),
     ]
     respaldos_filtrados = [r for r in respaldos if r[0] != pick_nombre]
     respaldos_filtrados.sort(key=lambda x: x[1], reverse=True)
-    alt_nombre, alt_prob, _ = respaldos_filtrados[0]
+    alt_nombre, alt_prob = respaldos_filtrados[0]
 
-    # Evaluar coherencia con últimos 5 partidos
     u_l = ult_local.head(5)
     u_v = ult_visita.head(5)
     goles_favor_l = np.where(u_l["HomeTeam"] == local, u_l["FTHG"], u_l["FTAG"]).mean() if len(u_l) else m["lam_l"]
@@ -175,14 +234,20 @@ def generar_dictamen_local(
 def mapear_equipo(nombre_api: str, equipos_csv: list[str]) -> str | None:
     if not nombre_api or not equipos_csv:
         return None
-    clave = nombre_api.strip().lower()
+    clave = normalizar_texto(nombre_api)
     if clave in ALIASES_EQUIPOS and ALIASES_EQUIPOS[clave] in equipos_csv:
         return ALIASES_EQUIPOS[clave]
-    for eq in equipos_csv:
-        if eq.lower() == clave:
-            return eq
-    coincidencias = difflib.get_close_matches(nombre_api, equipos_csv, n=1, cutoff=0.45)
-    return coincidencias[0] if coincidencias else None
+
+    mapa_norm = {normalizar_texto(eq): eq for eq in equipos_csv}
+    if clave in mapa_norm:
+        return mapa_norm[clave]
+
+    for norm_eq, orig_eq in mapa_norm.items():
+        if norm_eq in clave or clave in norm_eq:
+            return orig_eq
+
+    coincidencias = difflib.get_close_matches(clave, list(mapa_norm.keys()), n=1, cutoff=0.5)
+    return mapa_norm[coincidencias[0]] if coincidencias else None
 
 
 @st.cache_data(ttl=900)
@@ -228,25 +293,63 @@ def cargar_partidos_fecha(espn_slug: str, fecha_yyyymmdd: str) -> list[dict]:
 
 
 @st.cache_data(ttl=3600)
-def cargar_datos_historicos(codigo_liga: str, codigos_temp: list[str]) -> pd.DataFrame:
-    frames = []
-    for temp in codigos_temp:
-        url = f"https://www.football-data.co.uk/mmz4281/{temp}/{codigo_liga}.csv"
+def cargar_datos_historicos(
+    tipo_fuente: str,
+    codigo_liga: str,
+    codigos_temp: list[str],
+    nombres_temp: list[str],
+) -> pd.DataFrame:
+    if tipo_fuente == "eu":
+        frames = []
+        for temp in codigos_temp:
+            url = f"https://www.football-data.co.uk/mmz4281/{temp}/{codigo_liga}.csv"
+            try:
+                df = pd.read_csv(url, encoding="latin1")
+                df["Temporada"] = f"20{temp[:2]}/20{temp[2:]}"
+                frames.append(df)
+            except Exception:
+                continue
+        if not frames:
+            return pd.DataFrame()
+        data = pd.concat(frames, ignore_index=True)
+    else:
+        url = f"https://www.football-data.co.uk/new/{codigo_liga}.csv"
         try:
-            df = pd.read_csv(url, encoding="latin1")
-            df["Temporada"] = f"20{temp[:2]}/20{temp[2:]}"
-            frames.append(df)
+            data = pd.read_csv(url, encoding="latin1")
         except Exception:
-            continue
-    if not frames:
-        return pd.DataFrame()
-    data = pd.concat(frames, ignore_index=True)
+            return pd.DataFrame()
+
+        renombres = {
+            "Home": "HomeTeam",
+            "Away": "AwayTeam",
+            "HG": "FTHG",
+            "AG": "FTAG",
+            "Res": "FTR",
+            "Season": "Temporada",
+        }
+        data = data.rename(columns=renombres)
+        if "Temporada" in data.columns:
+            data["Temporada"] = data["Temporada"].astype(str)
+            anios_sel = set()
+            for nt in nombres_temp:
+                for parte in nt.split("/"):
+                    anios_sel.add(parte.strip())
+            filtrado = data[data["Temporada"].apply(lambda s: any(a in s for a in anios_sel))]
+            if not filtrado.empty:
+                data = filtrado
+            else:
+                ultimas_temps = sorted(data["Temporada"].dropna().unique())[-2:]
+                data = data[data["Temporada"].isin(ultimas_temps)]
+
     cols_base = [
         "Temporada", "Date", "HomeTeam", "AwayTeam",
         "FTHG", "FTAG", "FTR", "HS", "AS", "HST", "AST", "HC", "AC",
     ]
     cols_disponibles = [c for c in cols_base if c in data.columns]
-    data = data[cols_disponibles].dropna(subset=["HomeTeam", "AwayTeam", "FTHG", "FTAG"])
+    data = data[cols_disponibles].copy()
+    data["FTHG"] = pd.to_numeric(data["FTHG"], errors="coerce")
+    data["FTAG"] = pd.to_numeric(data["FTAG"], errors="coerce")
+    data = data.dropna(subset=["HomeTeam", "AwayTeam", "FTHG", "FTAG"])
     data["Date"] = pd.to_datetime(data["Date"], dayfirst=True, errors="coerce")
     return data.sort_values("Date", ascending=False)
 
@@ -370,7 +473,7 @@ hoy_local = datetime.now(ZONA_HORARIA_LOCAL).date()
 with st.sidebar:
     st.header("1. Jornada y Competición")
     fecha_sel = st.date_input("Fecha de partidos", value=hoy_local)
-    liga_nombre = st.selectbox("Competición", list(LIGAS.keys()))
+    liga_nombre = st.selectbox("Competición (19 ligas)", list(LIGAS.keys()))
     temps_sel = st.multiselect(
         "Temporadas históricas",
         list(TEMPORADAS.keys()),
@@ -395,15 +498,19 @@ if not temps_sel:
     st.stop()
 
 cfg_liga = LIGAS[liga_nombre]
-df_hist = cargar_datos_historicos(cfg_liga["csv"], [TEMPORADAS[t] for t in temps_sel])
+df_hist = cargar_datos_historicos(
+    cfg_liga["tipo"],
+    cfg_liga["csv"],
+    [TEMPORADAS[t] for t in temps_sel],
+    temps_sel,
+)
 
 if df_hist.empty:
-    st.error("No se pudieron recuperar datos históricos para esta liga.")
+    st.error("No se pudieron recuperar datos históricos para esta liga o temporada.")
     st.stop()
 
 equipos = sorted(df_hist["HomeTeam"].unique())
 
-# --- DETECCIÓN DE PARTIDOS DE LA FECHA ---
 partidos_hoy = cargar_partidos_fecha(cfg_liga["espn"], fecha_sel.strftime("%Y%m%d"))
 
 st.subheader(f"Cartelera detectada ({fecha_sel.strftime('%d/%m/%Y')}) — {liga_nombre}")
