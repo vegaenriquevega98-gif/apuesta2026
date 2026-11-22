@@ -1,4 +1,7 @@
 import math
+import difflib
+from datetime import datetime, timezone, timedelta
+import requests
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,16 +9,17 @@ import plotly.express as px
 import plotly.graph_objects as go
 from google import genai
 
-st.set_page_config(page_title="Football Historical Analytics", layout="wide")
+st.set_page_config(page_title="TuApuestas - Análisis Histórico & IA", layout="wide")
 
 MODELO_GEMINI = "gemini-3.8-flash"
+ZONA_HORARIA_LOCAL = timezone(timedelta(hours=-4))  # Hora Venezuela (UTC-4)
 
 LIGAS = {
-    "Premier League (Inglaterra)": "E0",
-    "LaLiga (España)": "SP1",
-    "Serie A (Italia)": "I1",
-    "Bundesliga (Alemania)": "D1",
-    "Ligue 1 (Francia)": "F1",
+    "Premier League (Inglaterra)": {"csv": "E0", "espn": "eng.1"},
+    "LaLiga (España)": {"csv": "SP1", "espn": "esp.1"},
+    "Serie A (Italia)": {"csv": "I1", "espn": "ita.1"},
+    "Bundesliga (Alemania)": {"csv": "D1", "espn": "ger.1"},
+    "Ligue 1 (Francia)": {"csv": "F1", "espn": "fra.1"},
 }
 
 TEMPORADAS = {
@@ -26,11 +30,110 @@ TEMPORADAS = {
     "2022/2023": "2223",
 }
 
+ALIASES_EQUIPOS = {
+    "manchester city": "Man City",
+    "manchester united": "Man United",
+    "nottingham forest": "Nott'm Forest",
+    "newcastle united": "Newcastle",
+    "wolverhampton wanderers": "Wolves",
+    "tottenham hotspur": "Tottenham",
+    "west ham united": "West Ham",
+    "brighton & hove albion": "Brighton",
+    "leicester city": "Leicester",
+    "ipswich town": "Ipswich",
+    "atlético madrid": "Ath Madrid",
+    "atletico madrid": "Ath Madrid",
+    "athletic club": "Ath Bilbao",
+    "athletic bilbao": "Ath Bilbao",
+    "real sociedad": "Sociedad",
+    "real betis": "Betis",
+    "rayo vallecano": "Vallecano",
+    "celta vigo": "Celta",
+    "deportivo alavés": "Alaves",
+    "deportivo alaves": "Alaves",
+    "rcd espanyol": "Espanol",
+    "internazionale": "Inter",
+    "inter milan": "Inter",
+    "ac milan": "Milan",
+    "as roma": "Roma",
+    "hellas verona": "Verona",
+    "bayern munich": "Bayern Munich",
+    "bayer leverkusen": "Leverkusen",
+    "borussia dortmund": "Dortmund",
+    "borussia mönchengladbach": "M'gladbach",
+    "borussia monchengladbach": "M'gladbach",
+    "eintracht frankfurt": "Ein Frankfurt",
+    "vfb stuttgart": "Stuttgart",
+    "sc freiburg": "Freiburg",
+    "paris saint-germain": "Paris SG",
+    "as monaco": "Monaco",
+    "olympique marseille": "Marseille",
+    "olympique lyonnais": "Lyon",
+    "stade rennais": "Rennes",
+    "as saint-étienne": "St Etienne",
+    "as saint-etienne": "St Etienne",
+}
+
 
 def poisson_pmf(k: int, lam: float) -> float:
     if lam <= 0:
         return 1.0 if k == 0 else 0.0
     return (lam ** k) * math.exp(-lam) / math.factorial(k)
+
+
+def mapear_equipo(nombre_api: str, equipos_csv: list[str]) -> str | None:
+    if not nombre_api or not equipos_csv:
+        return None
+    clave = nombre_api.strip().lower()
+    if clave in ALIASES_EQUIPOS and ALIASES_EQUIPOS[clave] in equipos_csv:
+        return ALIASES_EQUIPOS[clave]
+    for eq in equipos_csv:
+        if eq.lower() == clave:
+            return eq
+    coincidencias = difflib.get_close_matches(nombre_api, equipos_csv, n=1, cutoff=0.45)
+    return coincidencias[0] if coincidencias else None
+
+
+@st.cache_data(ttl=900)
+def cargar_partidos_fecha(espn_slug: str, fecha_yyyymmdd: str) -> list[dict]:
+    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{espn_slug}/scoreboard?dates={fecha_yyyymmdd}"
+    partidos = []
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        for ev in data.get("events", []):
+            comp = ev.get("competitions", [{}])[0]
+            competidores = comp.get("competitors", [])
+            local_raw, visita_raw = "", ""
+            for c in competidores:
+                nombre = c.get("team", {}).get("displayName", "")
+                if c.get("homeAway") == "home":
+                    local_raw = nombre
+                elif c.get("homeAway") == "away":
+                    visita_raw = nombre
+
+            fecha_iso = ev.get("date", "")
+            hora_local_str = ""
+            if fecha_iso:
+                try:
+                    dt_utc = datetime.fromisoformat(fecha_iso.replace("Z", "+00:00"))
+                    dt_loc = dt_utc.astimezone(ZONA_HORARIA_LOCAL)
+                    hora_local_str = dt_loc.strftime("%I:%M %p")
+                except Exception:
+                    hora_local_str = fecha_iso
+
+            estado = ev.get("status", {}).get("type", {}).get("shortDetail", "")
+            if local_raw and visita_raw:
+                partidos.append({
+                    "local_api": local_raw,
+                    "visita_api": visita_raw,
+                    "hora": hora_local_str,
+                    "estado": estado,
+                })
+    except Exception:
+        return []
+    return partidos
 
 
 @st.cache_data(ttl=3600)
@@ -85,8 +188,23 @@ def calcular_metricas_poisson(df: pd.DataFrame, local: str, visita: str):
     prob_over25 = sum(
         matriz[i, j] for i in range(max_goles) for j in range(max_goles) if (i + j) >= 3
     )
+    prob_under25 = 1.0 - prob_over25
+    prob_1x = prob_1 + prob_x
+    prob_x2 = prob_x + prob_2
 
-    return lambda_local, lambda_visita, prob_1, prob_x, prob_2, prob_btts, prob_over25, matriz
+    return {
+        "lam_l": lambda_local,
+        "lam_v": lambda_visita,
+        "p1": prob_1,
+        "px": prob_x,
+        "p2": prob_2,
+        "p1x": prob_1x,
+        "px2": prob_x2,
+        "btts": prob_btts,
+        "over25": prob_over25,
+        "under25": prob_under25,
+        "matriz": matriz,
+    }
 
 
 def construir_contexto_ia(
@@ -94,26 +212,17 @@ def construir_contexto_ia(
     temps: list[str],
     local: str,
     visita: str,
-    lam_l: float,
-    lam_v: float,
-    p1: float,
-    px_prob: float,
-    p2: float,
-    p_btts: float,
-    p_over25: float,
-    matriz: np.ndarray,
+    m: dict,
     h2h_df: pd.DataFrame,
     ult_local: pd.DataFrame,
     ult_visita: pd.DataFrame,
 ) -> str:
+    matriz = m["matriz"]
     indices_top = np.dstack(np.unravel_index(np.argsort(matriz.ravel())[::-1][:3], matriz.shape))[0]
-    top_marcadores = ", ".join(
-        [f"{i}-{j} ({matriz[i, j]*100:.1f}%)" for i, j in indices_top]
-    )
+    top_marcadores = ", ".join([f"{i}-{j} ({matriz[i, j]*100:.1f}%)" for i, j in indices_top])
 
-    cuota_1 = f"{1/p1:.2f}" if p1 > 0 else "N/A"
-    cuota_x = f"{1/px_prob:.2f}" if px_prob > 0 else "N/A"
-    cuota_2 = f"{1/p2:.2f}" if p2 > 0 else "N/A"
+    def cuota(p: float) -> str:
+        return f"{1/p:.2f}" if p > 0.01 else "N/A"
 
     resumen_h2h = (
         h2h_df[["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]].head(5).to_string(index=False)
@@ -124,14 +233,23 @@ def construir_contexto_ia(
     resumen_v = ult_visita[["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]].head(5).to_string(index=False)
 
     return f"""
-Actúa como un analista cuantitativo de fútbol experto en modelos de Poisson, mercados asiáticos y valor esperado (EV).
-Responde siempre en español, de forma directa, objetiva y respaldada estrictamente en los datos del partido:
+Actúa como un analista cuantitativo de fútbol experto en modelos de Poisson, probabilidad implícita y gestión de riesgo.
+Tu objetivo es emitir un DICTAMEN ESTADÍSTICO DECISIVO sobre el escenario más probable del partido, respaldado estrictamente por estos números:
 
 - Competición: {liga} | Temporadas: {', '.join(temps)}
 - Partido: {local} (Local) vs {visita} (Visitante)
-- Goles Esperados (Lambda): {local} = {lam_l:.2f} | {visita} = {lam_v:.2f}
-- Probabilidades Modelo 1X2: Local {p1*100:.1f}% (Cuota justa: {cuota_1}) | Empate {px_prob*100:.1f}% (Cuota justa: {cuota_x}) | Visita {p2*100:.1f}% (Cuota justa: {cuota_2})
-- Mercados de Goles: Over 2.5 = {p_over25*100:.1f}% | Ambos Marcan (BTTS) = {p_btts*100:.1f}%
+- Goles Esperados (Lambda): {local} = {m['lam_l']:.2f} | {visita} = {m['lam_v']:.2f} (Total esperado: {m['lam_l'] + m['lam_v']:.2f})
+- Probabilidades 1X2 y Cuota Justa:
+  * Local ({local}): {m['p1']*100:.1f}% (Cuota justa: {cuota(m['p1'])})
+  * Empate: {m['px']*100:.1f}% (Cuota justa: {cuota(m['px'])})
+  * Visitante ({visita}): {m['p2']*100:.1f}% (Cuota justa: {cuota(m['p2'])})
+- Doble Oportunidad:
+  * 1X: {m['p1x']*100:.1f}% (Cuota justa: {cuota(m['p1x'])})
+  * X2: {m['px2']*100:.1f}% (Cuota justa: {cuota(m['px2'])})
+- Mercados de Goles:
+  * Over 2.5: {m['over25']*100:.1f}% (Cuota justa: {cuota(m['over25'])})
+  * Under 2.5: {m['under25']*100:.1f}% (Cuota justa: {cuota(m['under25'])})
+  * Ambos Marcan (BTTS Sí): {m['btts']*100:.1f}% (Cuota justa: {cuota(m['btts'])})
 - Top 3 Marcadores Exactos: {top_marcadores}
 
 Últimos 5 partidos de {local}:
@@ -145,51 +263,89 @@ Historial Directo (H2H):
 """
 
 
-st.title("Panel de Análisis Histórico de Fútbol")
+st.title("Panel de Análisis Histórico & Dictamen IA")
+
+hoy_local = datetime.now(ZONA_HORARIA_LOCAL).date()
 
 with st.sidebar:
-    st.header("Filtros Históricos")
+    st.header("1. Jornada y Competición")
+    fecha_sel = st.date_input("Fecha de partidos", value=hoy_local)
     liga_nombre = st.selectbox("Competición", list(LIGAS.keys()))
     temps_sel = st.multiselect(
-        "Temporadas a incluir",
+        "Temporadas históricas",
         list(TEMPORADAS.keys()),
         default=["2026/2027", "2025/2026"],
     )
+
     st.divider()
-    st.header("Configuración IA")
-    api_key_secret = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
-    api_key_input = st.text_input(
-        "Gemini API Key",
-        value=api_key_secret,
-        type="password",
-        help="Obtén tu clave gratuita en Google AI Studio o guárdala en Streamlit Secrets como GEMINI_API_KEY.",
-    )
+    st.header("2. Estado del Asistente IA")
+    if "GEMINI_API_KEY" in st.secrets and st.secrets["GEMINI_API_KEY"]:
+        api_key_input = st.secrets["GEMINI_API_KEY"]
+        st.success("Gemini API conectada")
+    else:
+        api_key_input = st.text_input(
+            "Gemini API Key",
+            type="password",
+            help="Guárdala en Streamlit Secrets como GEMINI_API_KEY.",
+        )
 
 if not temps_sel:
-    st.warning("Selecciona al menos una temporada en el panel lateral.")
+    st.warning("Selecciona al menos una temporada histórica en el panel lateral.")
     st.stop()
 
-df_hist = cargar_datos_historicos(LIGAS[liga_nombre], [TEMPORADAS[t] for t in temps_sel])
+cfg_liga = LIGAS[liga_nombre]
+df_hist = cargar_datos_historicos(cfg_liga["csv"], [TEMPORADAS[t] for t in temps_sel])
 
 if df_hist.empty:
-    st.error("No se pudieron recuperar datos para la combinación seleccionada.")
+    st.error("No se pudieron recuperar datos históricos para esta liga.")
     st.stop()
 
 equipos = sorted(df_hist["HomeTeam"].unique())
+
+# --- DETECCIÓN DE PARTIDOS DE LA FECHA ---
+partidos_hoy = cargar_partidos_fecha(cfg_liga["espn"], fecha_sel.strftime("%Y%m%d"))
+
+st.subheader(f"Cartelera detectada ({fecha_sel.strftime('%d/%m/%Y')}) — {liga_nombre}")
+
+idx_local_default = 0
+idx_visita_default = min(1, len(equipos) - 1)
+
+if partidos_hoy:
+    opciones_jornada = ["Selección manual de equipos"] + [
+        f"{p['hora']} | {p['local_api']} vs {p['visita_api']} ({p['estado']})"
+        for p in partidos_hoy
+    ]
+    partido_elegido = st.selectbox(
+        "Selecciona un partido programado para cargar su análisis automáticamente:",
+        opciones_jornada,
+        index=1,
+    )
+    if partido_elegido != "Selección manual de equipos":
+        pos = opciones_jornada.index(partido_elegido) - 1
+        elegido = partidos_hoy[pos]
+        loc_mapeado = mapear_equipo(elegido["local_api"], equipos)
+        vis_mapeado = mapear_equipo(elegido["visita_api"], equipos)
+        if loc_mapeado in equipos:
+            idx_local_default = equipos.index(loc_mapeado)
+        if vis_mapeado in equipos:
+            idx_visita_default = equipos.index(vis_mapeado)
+else:
+    st.info(f"No hay partidos programados de {liga_nombre} para el {fecha_sel.strftime('%d/%m/%Y')}. Puedes elegir cualquier cruce manualmente abajo.")
+
 col1, col2 = st.columns(2)
-equipo_local = col1.selectbox("Equipo Local", equipos, index=0)
-equipo_visita = col2.selectbox("Equipo Visitante", equipos, index=min(1, len(equipos) - 1))
+equipo_local = col1.selectbox("Equipo Local", equipos, index=idx_local_default)
+equipo_visita = col2.selectbox("Equipo Visitante", equipos, index=idx_visita_default)
 
-lam_l, lam_v, p1, px_prob, p2, p_btts, p_over25, matriz_prob = calcular_metricas_poisson(
-    df_hist, equipo_local, equipo_visita
-)
+metricas = calcular_metricas_poisson(df_hist, equipo_local, equipo_visita)
+matriz_prob = metricas["matriz"]
 
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Goles Esperados Local (λ)", f"{lam_l:.2f}")
-m2.metric("Goles Esperados Visita (λ)", f"{lam_v:.2f}")
-m3.metric("Prob. Victoria Local", f"{p1*100:.1f}%")
-m4.metric("Prob. Empate", f"{px_prob*100:.1f}%")
-m5.metric("Prob. Victoria Visita", f"{p2*100:.1f}%")
+m1, m2, m3, m4, m5, m6 = st.columns(6)
+m1.metric("λ Goles Local", f"{metricas['lam_l']:.2f}")
+m2.metric("λ Goles Visita", f"{metricas['lam_v']:.2f}")
+m3.metric("Local (1)", f"{metricas['p1']*100:.1f}%")
+m4.metric("Empate (X)", f"{metricas['px']*100:.1f}%")
+m5.metric("Visita (2)", f"{metricas['p2']*100:.1f}%")
+m6.metric("Over 2.5", f"{metricas['over25']*100:.1f}%")
 
 h2h = df_hist[
     ((df_hist["HomeTeam"] == equipo_local) & (df_hist["AwayTeam"] == equipo_visita))
@@ -199,13 +355,75 @@ ultimos_local = df_hist[(df_hist["HomeTeam"] == equipo_local) | (df_hist["AwayTe
 ultimos_visita = df_hist[(df_hist["HomeTeam"] == equipo_visita) | (df_hist["AwayTeam"] == equipo_visita)].head(15).copy()
 
 tab1, tab2, tab3, tab4 = st.tabs([
+    "Dictamen Analítico IA",
     "Matriz de Marcadores",
     "Historial Directo (H2H)",
     "Tendencia de Goles",
-    "Asistente Analítico IA",
 ])
 
 with tab1:
+    st.subheader(f"Dictamen Estadístico: {equipo_local} vs {equipo_visita}")
+
+    partido_id = f"{liga_nombre}_{equipo_local}_{equipo_visita}_{'_'.join(temps_sel)}"
+    if st.session_state.get("partido_actual") != partido_id:
+        st.session_state["partido_actual"] = partido_id
+        st.session_state["mensajes_ia"] = []
+
+    contexto_sistema = construir_contexto_ia(
+        liga_nombre, temps_sel, equipo_local, equipo_visita,
+        metricas, h2h, ultimos_local, ultimos_visita,
+    )
+
+    if not api_key_input:
+        st.warning("Configura GEMINI_API_KEY en Streamlit Secrets para activar el dictamen automático.")
+    else:
+        client = genai.Client(api_key=api_key_input)
+
+        if st.button("Emitir Dictamen Más Probable", type="primary"):
+            prompt_dictamen = (
+                "Emite un DICTAMEN FINAL estructurado y directo con este formato exacto:\n"
+                "1. **PICK MÁS PROBABLE (Veredicto Principal):** Indica el mercado con mayor respaldo matemático "
+                "(1X2, Doble Oportunidad, Over/Under 2.5 o BTTS), su probabilidad %, y la cuota mínima rentable para entrar.\n"
+                "2. **ALTERNATIVA CONSERVADORA:** Una jugada de respaldo de menor varianza.\n"
+                "3. **MARCADOR EXACTO PROYECTADO Y NIVEL DE CONFIANZA:** (Bajo / Medio / Alto) según coherencia entre Poisson y racha de últimos 5 partidos.\n"
+                "4. **JUSTIFICACIÓN Y RIESGO CLAVE:** Explica brevemente por qué los números favorecen este dictamen y qué factor podría invalidarlo."
+            )
+            with st.spinner("Calculando veredicto estadístico más probable..."):
+                try:
+                    resp = client.models.generate_content(
+                        model=MODELO_GEMINI,
+                        contents=f"{contexto_sistema}\n\nInstrucción:\n{prompt_dictamen}",
+                    )
+                    st.session_state["mensajes_ia"] = [{"role": "assistant", "content": resp.text}]
+                except Exception as e:
+                    st.error(f"Error al consultar Gemini: {e}")
+
+        for msg in st.session_state["mensajes_ia"]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        pregunta = st.chat_input("Pregunta por una cuota específica (ej: 'La casa paga 1.95 al Over 2.5, ¿tiene valor?')...")
+        if pregunta:
+            st.session_state["mensajes_ia"].append({"role": "user", "content": pregunta})
+            with st.chat_message("user"):
+                st.markdown(pregunta)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Evaluando consulta..."):
+                    try:
+                        historial_chat = "\n".join(
+                            [f"{m['role'].upper()}: {m['content']}" for m in st.session_state["mensajes_ia"]]
+                        )
+                        resp = client.models.generate_content(
+                            model=MODELO_GEMINI,
+                            contents=f"{contexto_sistema}\n\nConversación previa:\n{historial_chat}",
+                        )
+                        st.markdown(resp.text)
+                        st.session_state["mensajes_ia"].append({"role": "assistant", "content": resp.text})
+                    except Exception as e:
+                        st.error(f"Error al consultar Gemini: {e}")
+
+with tab2:
     fig_heat = go.Figure(
         data=go.Heatmap(
             z=matriz_prob * 100,
@@ -219,10 +437,10 @@ with tab1:
     fig_heat.update_layout(title="Probabilidad de Marcador Exacto (%)", height=450)
     st.plotly_chart(fig_heat, use_container_width=True)
 
-with tab2:
+with tab3:
     st.dataframe(h2h, use_container_width=True, hide_index=True)
 
-with tab3:
+with tab4:
     ultimos_local["Goles_Equipo"] = np.where(
         ultimos_local["HomeTeam"] == equipo_local, ultimos_local["FTHG"], ultimos_local["FTAG"]
     )
@@ -234,66 +452,3 @@ with tab3:
         title=f"Últimos 15 partidos de {equipo_local} (Goles anotados)",
     )
     st.plotly_chart(fig_line, use_container_width=True)
-
-with tab4:
-    st.subheader(f"Análisis Inteligente: {equipo_local} vs {equipo_visita}")
-
-    partido_id = f"{liga_nombre}_{equipo_local}_{equipo_visita}_{'_'.join(temps_sel)}"
-    if st.session_state.get("partido_actual") != partido_id:
-        st.session_state["partido_actual"] = partido_id
-        st.session_state["mensajes_ia"] = []
-
-    contexto_sistema = construir_contexto_ia(
-        liga_nombre, temps_sel, equipo_local, equipo_visita,
-        lam_l, lam_v, p1, px_prob, p2, p_btts, p_over25,
-        matriz_prob, h2h, ultimos_local, ultimos_visita,
-    )
-
-    if not api_key_input:
-        st.info("Introduce tu Gemini API Key en el menú lateral para activar el chat analítico en vivo.")
-        with st.expander("Ver datos estructurados listos para copiar"):
-            st.code(contexto_sistema, language="text")
-    else:
-        client = genai.Client(api_key=api_key_input)
-
-        if st.button("Generar diagnóstico rápido del partido", type="primary"):
-            prompt_diagnostico = (
-                "Realiza un diagnóstico breve del partido en 3 puntos: "
-                "1) Lectura de fuerzas ofensivas/defensivas y cuota justa 1X2, "
-                "2) Tendencia en mercados de goles (Over/Under 2.5 y BTTS), y "
-                "3) Principal riesgo estadístico según la racha reciente."
-            )
-            with st.spinner("Analizando métricas de Poisson y rachas..."):
-                try:
-                    resp = client.models.generate_content(
-                        model=MODELO_GEMINI,
-                        contents=f"{contexto_sistema}\n\nSolicitud del usuario: {prompt_diagnostico}",
-                    )
-                    st.session_state["mensajes_ia"].append({"role": "assistant", "content": resp.text})
-                except Exception as e:
-                    st.error(f"Error al consultar Gemini: {e}")
-
-        for msg in st.session_state["mensajes_ia"]:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        pregunta = st.chat_input("Ej: ¿Hay valor si la casa paga 2.15 por el local o mejor entro al Over 2.5?")
-        if pregunta:
-            st.session_state["mensajes_ia"].append({"role": "user", "content": pregunta})
-            with st.chat_message("user"):
-                st.markdown(pregunta)
-
-            with st.chat_message("assistant"):
-                with st.spinner("Calculando respuesta..."):
-                    try:
-                        historial_chat = "\n".join(
-                            [f"{m['role'].upper()}: {m['content']}" for m in st.session_state["mensajes_ia"]]
-                        )
-                        resp = client.models.generate_content(
-                            model=MODELO_GEMINI,
-                            contents=f"{contexto_sistema}\n\nConversación previa:\n{historial_chat}",
-                        )
-                        st.markdown(resp.text)
-                        st.session_state["mensajes_ia"].append({"role": "assistant", "content": resp.text})
-                    except Exception as e:
-                        st.error(f"Error al consultar Gemini: {e}")
