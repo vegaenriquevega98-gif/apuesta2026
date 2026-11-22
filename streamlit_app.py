@@ -12,7 +12,7 @@ from google import genai
 
 st.set_page_config(page_title="TuApuestas - Análisis Histórico & IA", layout="wide")
 
-MODELO_GEMINI = "gemini-3.8-flash"
+MODELO_GEMINI_DEFAULT = "gemini-3.8-flash"
 ZONA_HORARIA_LOCAL = timezone(timedelta(hours=-4))  # Hora Venezuela (UTC-4)
 
 LIGAS = {
@@ -82,12 +82,12 @@ def poisson_pmf(k: int, lam: float) -> float:
     return (lam ** k) * math.exp(-lam) / math.factorial(k)
 
 
-def consultar_gemini(client: genai.Client, prompt: str, reintentos: int = 3) -> str:
+def consultar_gemini(client: genai.Client, modelo: str, prompt: str, reintentos: int = 2) -> str:
     ultimo_error = None
     for intento in range(reintentos):
         try:
             resp = client.models.generate_content(
-                model=MODELO_GEMINI,
+                model=modelo.strip(),
                 contents=prompt,
             )
             return resp.text
@@ -96,9 +96,80 @@ def consultar_gemini(client: genai.Client, prompt: str, reintentos: int = 3) -> 
             texto_error = str(e)
             es_temporal = ("503" in texto_error) or ("UNAVAILABLE" in texto_error) or ("429" in texto_error)
             if es_temporal and intento < reintentos - 1:
-                time.sleep(2 * (intento + 1))
+                time.sleep(1.5 * (intento + 1))
                 continue
             raise ultimo_error
+
+
+def generar_dictamen_local(
+    local: str,
+    visita: str,
+    m: dict,
+    ult_local: pd.DataFrame,
+    ult_visita: pd.DataFrame,
+) -> str:
+    """Motor cuantitativo de respaldo cuando la API externa devuelve 503."""
+    def cuota(p: float) -> str:
+        return f"{1/p:.2f}" if p > 0.01 else "N/A"
+
+    matriz = m["matriz"]
+    idx_top = np.unravel_index(np.argmax(matriz), matriz.shape)
+    marcador_top = f"{idx_top[0]}-{idx_top[1]} ({matriz[idx_top]*100:.1f}%)"
+
+    candidatos_principales = [
+        (f"Victoria Local ({local})", m["p1"], "resultado"),
+        (f"Victoria Visitante ({visita})", m["p2"], "resultado"),
+        ("Más de 2.5 Goles (Over 2.5)", m["over25"], "goles"),
+        ("Menos de 2.5 Goles (Under 2.5)", m["under25"], "goles"),
+        ("Ambos Equipos Marcan (BTTS Sí)", m["btts"], "goles"),
+    ]
+    # Si ningún 1X2 supera 55%, incluir Doble Oportunidad como candidato principal
+    if max(m["p1"], m["p2"]) < 0.55:
+        candidatos_principales.extend([
+            (f"Doble Oportunidad 1X ({local} o Empate)", m["p1x"], "resultado"),
+            (f"Doble Oportunidad X2 (Empate o {visita})", m["px2"], "resultado"),
+        ])
+
+    candidatos_principales.sort(key=lambda x: x[1], reverse=True)
+    pick_nombre, pick_prob, pick_tipo = candidatos_principales[0]
+
+    respaldos = [
+        (f"Doble Oportunidad 1X ({local} o Empate)", m["p1x"], "resultado"),
+        (f"Doble Oportunidad X2 (Empate o {visita})", m["px2"], "resultado"),
+        ("Más de 1.5 Goles (Over 1.5)", m["over15"], "goles"),
+        ("Menos de 3.5 Goles (Under 3.5)", m["under35"], "goles"),
+    ]
+    respaldos_filtrados = [r for r in respaldos if r[0] != pick_nombre]
+    respaldos_filtrados.sort(key=lambda x: x[1], reverse=True)
+    alt_nombre, alt_prob, _ = respaldos_filtrados[0]
+
+    # Evaluar coherencia con últimos 5 partidos
+    u_l = ult_local.head(5)
+    u_v = ult_visita.head(5)
+    goles_favor_l = np.where(u_l["HomeTeam"] == local, u_l["FTHG"], u_l["FTAG"]).mean() if len(u_l) else m["lam_l"]
+    goles_favor_v = np.where(u_v["HomeTeam"] == visita, u_v["FTHG"], u_v["FTAG"]).mean() if len(u_v) else m["lam_v"]
+
+    if pick_prob >= 0.65:
+        confianza = "Alto"
+    elif pick_prob >= 0.52:
+        confianza = "Medio"
+    else:
+        confianza = "Bajo (partido de alta paridad)"
+
+    total_lambda = m["lam_l"] + m["lam_v"]
+    riesgo = (
+        f"La proyección total de goles es ajustada ({total_lambda:.2f}); cualquier expulsión o gol temprano altera la distribución."
+        if 2.2 <= total_lambda <= 2.8
+        else f"{local} promedia {goles_favor_l:.1f} goles en sus últimos 5 juegos y {visita} {goles_favor_v:.1f}; vigilar rotaciones de alineación."
+    )
+
+    return (
+        "> *Nota: Los servidores de Gemini presentaron saturación (503). Dictamen emitido automáticamente por el motor cuantitativo local.*\n\n"
+        f"1. **PICK MÁS PROBABLE (Veredicto Principal):** **{pick_nombre}** — Probabilidad matemática: **{pick_prob*100:.1f}%** | Cuota mínima rentable (Fair Odds): **{cuota(pick_prob)}**.\n"
+        f"2. **ALTERNATIVA CONSERVADORA:** **{alt_nombre}** — Probabilidad: **{alt_prob*100:.1f}%** | Cuota mínima rentable: **{cuota(alt_prob)}**.\n"
+        f"3. **MARCADOR EXACTO PROYECTADO Y NIVEL DE CONFIANZA:** **{marcador_top}** | Nivel de confianza: **{confianza}**.\n"
+        f"4. **JUSTIFICACIÓN Y RIESGO CLAVE:** Con fuerzas esperadas de **{m['lam_l']:.2f} goles** para {local} y **{m['lam_v']:.2f} goles** para {visita}, el modelo concentra la mayor masa de probabilidad en este escenario. **Riesgo:** {riesgo}"
+    )
 
 
 def mapear_equipo(nombre_api: str, equipos_csv: list[str]) -> str | None:
@@ -205,8 +276,14 @@ def calcular_metricas_poisson(df: pd.DataFrame, local: str, visita: str):
     prob_x = np.trace(matriz)
     prob_2 = np.triu(matriz, 1).sum()
     prob_btts = matriz[1:, 1:].sum()
+    prob_over15 = sum(
+        matriz[i, j] for i in range(max_goles) for j in range(max_goles) if (i + j) >= 2
+    )
     prob_over25 = sum(
         matriz[i, j] for i in range(max_goles) for j in range(max_goles) if (i + j) >= 3
+    )
+    prob_under35 = sum(
+        matriz[i, j] for i in range(max_goles) for j in range(max_goles) if (i + j) <= 3
     )
     prob_under25 = 1.0 - prob_over25
     prob_1x = prob_1 + prob_x
@@ -221,8 +298,10 @@ def calcular_metricas_poisson(df: pd.DataFrame, local: str, visita: str):
         "p1x": prob_1x,
         "px2": prob_x2,
         "btts": prob_btts,
+        "over15": prob_over15,
         "over25": prob_over25,
         "under25": prob_under25,
+        "under35": prob_under35,
         "matriz": matriz,
     }
 
@@ -267,6 +346,7 @@ Tu objetivo es emitir un DICTAMEN ESTADÍSTICO DECISIVO sobre el escenario más 
   * 1X: {m['p1x']*100:.1f}% (Cuota justa: {cuota(m['p1x'])})
   * X2: {m['px2']*100:.1f}% (Cuota justa: {cuota(m['px2'])})
 - Mercados de Goles:
+  * Over 1.5: {m['over15']*100:.1f}% (Cuota justa: {cuota(m['over15'])})
   * Over 2.5: {m['over25']*100:.1f}% (Cuota justa: {cuota(m['over25'])})
   * Under 2.5: {m['under25']*100:.1f}% (Cuota justa: {cuota(m['under25'])})
   * Ambos Marcan (BTTS Sí): {m['btts']*100:.1f}% (Cuota justa: {cuota(m['btts'])})
@@ -298,7 +378,7 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("2. Estado del Asistente IA")
+    st.header("2. Configuración del Asistente IA")
     if "GEMINI_API_KEY" in st.secrets and st.secrets["GEMINI_API_KEY"]:
         api_key_input = st.secrets["GEMINI_API_KEY"]
         st.success("Gemini API conectada")
@@ -308,6 +388,7 @@ with st.sidebar:
             type="password",
             help="Guárdala en Streamlit Secrets como GEMINI_API_KEY.",
         )
+    modelo_gemini_sel = st.text_input("Modelo Gemini", value=MODELO_GEMINI_DEFAULT)
 
 if not temps_sel:
     st.warning("Selecciona al menos una temporada histórica en el panel lateral.")
@@ -394,58 +475,83 @@ with tab1:
         metricas, h2h, ultimos_local, ultimos_visita,
     )
 
-    if not api_key_input:
-        st.warning("Configura GEMINI_API_KEY en Streamlit Secrets para activar el dictamen automático.")
-    else:
-        client = genai.Client(api_key=api_key_input)
-
-        if st.button("Emitir Dictamen Más Probable", type="primary"):
-            prompt_dictamen = (
-                "Emite un DICTAMEN FINAL estructurado y directo con este formato exacto:\n"
-                "1. **PICK MÁS PROBABLE (Veredicto Principal):** Indica el mercado con mayor respaldo matemático "
-                "(1X2, Doble Oportunidad, Over/Under 2.5 o BTTS), su probabilidad %, y la cuota mínima rentable para entrar.\n"
-                "2. **ALTERNATIVA CONSERVADORA:** Una jugada de respaldo de menor varianza.\n"
-                "3. **MARCADOR EXACTO PROYECTADO Y NIVEL DE CONFIANZA:** (Bajo / Medio / Alto) según coherencia entre Poisson y racha de últimos 5 partidos.\n"
-                "4. **JUSTIFICACIÓN Y RIESGO CLAVE:** Explica brevemente por qué los números favorecen este dictamen y qué factor podría invalidarlo."
-            )
-            with st.spinner("Calculando veredicto estadístico más probable..."):
+    if st.button("Emitir Dictamen Más Probable", type="primary"):
+        prompt_dictamen = (
+            "Emite un DICTAMEN FINAL estructurado y directo con este formato exacto:\n"
+            "1. **PICK MÁS PROBABLE (Veredicto Principal):** Indica el mercado con mayor respaldo matemático "
+            "(1X2, Doble Oportunidad, Over/Under 2.5 o BTTS), su probabilidad %, y la cuota mínima rentable para entrar.\n"
+            "2. **ALTERNATIVA CONSERVADORA:** Una jugada de respaldo de menor varianza.\n"
+            "3. **MARCADOR EXACTO PROYECTADO Y NIVEL DE CONFIANZA:** (Bajo / Medio / Alto) según coherencia entre Poisson y racha de últimos 5 partidos.\n"
+            "4. **JUSTIFICACIÓN Y RIESGO CLAVE:** Explica brevemente por qué los números favorecen este dictamen y qué factor podría invalidarlo."
+        )
+        with st.spinner("Calculando veredicto estadístico más probable..."):
+            if not api_key_input:
+                respuesta = generar_dictamen_local(equipo_local, equipo_visita, metricas, ultimos_local, ultimos_visita)
+                st.session_state["mensajes_ia"] = [{"role": "assistant", "content": respuesta}]
+            else:
+                client = genai.Client(api_key=api_key_input)
                 try:
                     respuesta = consultar_gemini(
                         client,
+                        modelo_gemini_sel,
                         f"{contexto_sistema}\n\nInstrucción:\n{prompt_dictamen}",
                     )
                     st.session_state["mensajes_ia"] = [{"role": "assistant", "content": respuesta}]
                 except Exception as e:
-                    if "503" in str(e) or "UNAVAILABLE" in str(e):
-                        st.warning("Los servidores de Gemini tienen alta demanda en este instante. Espera 5 segundos y vuelve a pulsar el botón.")
+                    if "503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e):
+                        respuesta_local = generar_dictamen_local(
+                            equipo_local, equipo_visita, metricas, ultimos_local, ultimos_visita
+                        )
+                        st.session_state["mensajes_ia"] = [{"role": "assistant", "content": respuesta_local}]
                     else:
                         st.error(f"Error al consultar Gemini: {e}")
 
-        for msg in st.session_state["mensajes_ia"]:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+    for msg in st.session_state["mensajes_ia"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-        pregunta = st.chat_input("Pregunta por una cuota específica (ej: 'La casa paga 1.95 al Over 2.5, ¿tiene valor?')...")
-        if pregunta:
-            st.session_state["mensajes_ia"].append({"role": "user", "content": pregunta})
-            with st.chat_message("user"):
-                st.markdown(pregunta)
+    pregunta = st.chat_input("Pregunta por una cuota específica (ej: 'La casa paga 1.95 al Over 2.5, ¿tiene valor?')...")
+    if pregunta:
+        st.session_state["mensajes_ia"].append({"role": "user", "content": pregunta})
+        with st.chat_message("user"):
+            st.markdown(pregunta)
 
-            with st.chat_message("assistant"):
-                with st.spinner("Evaluando consulta..."):
+        with st.chat_message("assistant"):
+            with st.spinner("Evaluando consulta..."):
+                if not api_key_input:
+                    respuesta = generar_dictamen_local(equipo_local, equipo_visita, metricas, ultimos_local, ultimos_visita)
+                    st.markdown(respuesta)
+                    st.session_state["mensajes_ia"].append({"role": "assistant", "content": respuesta})
+                else:
+                    client = genai.Client(api_key=api_key_input)
                     try:
                         historial_chat = "\n".join(
                             [f"{m['role'].upper()}: {m['content']}" for m in st.session_state["mensajes_ia"]]
                         )
                         respuesta = consultar_gemini(
                             client,
+                            modelo_gemini_sel,
                             f"{contexto_sistema}\n\nConversación previa:\n{historial_chat}",
                         )
                         st.markdown(respuesta)
                         st.session_state["mensajes_ia"].append({"role": "assistant", "content": respuesta})
                     except Exception as e:
-                        if "503" in str(e) or "UNAVAILABLE" in str(e):
-                            st.warning("Los servidores de Gemini tienen alta demanda en este instante. Intenta enviar tu pregunta nuevamente en unos segundos.")
+                        if "503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e):
+                            def f_cuota(p: float) -> str:
+                                return f"{1/p:.2f}" if p > 0.01 else "N/A"
+                            tabla_ev = (
+                                "> *Servidores de Gemini saturados (503). Aquí tienes las cuotas mínimas rentables (Fair Odds) para comparar directamente contra tu casa de apuestas (si la casa paga MÁS que la cuota justa, hay Valor Esperado positivo):*\n\n"
+                                f"- **Local ({equipo_local}):** {metricas['p1']*100:.1f}% → Cuota justa **{f_cuota(metricas['p1'])}**\n"
+                                f"- **Empate (X):** {metricas['px']*100:.1f}% → Cuota justa **{f_cuota(metricas['px'])}**\n"
+                                f"- **Visita ({equipo_visita}):** {metricas['p2']*100:.1f}% → Cuota justa **{f_cuota(metricas['p2'])}**\n"
+                                f"- **Doble Oportunidad 1X:** {metricas['p1x']*100:.1f}% → Cuota justa **{f_cuota(metricas['p1x'])}**\n"
+                                f"- **Doble Oportunidad X2:** {metricas['px2']*100:.1f}% → Cuota justa **{f_cuota(metricas['px2'])}**\n"
+                                f"- **Over 2.5 Goles:** {metricas['over25']*100:.1f}% → Cuota justa **{f_cuota(metricas['over25'])}**\n"
+                                f"- **Under 2.5 Goles:** {metricas['under25']*100:.1f}% → Cuota justa **{f_cuota(metricas['under25'])}**\n"
+                                f"- **Ambos Marcan (BTTS):** {metricas['btts']*100:.1f}% → Cuota justa **{f_cuota(metricas['btts'])}**"
+                            )
+                            st.markdown(tabla_ev)
+                            st.session_state["mensajes_ia"].append({"role": "assistant", "content": tabla_ev})
                         else:
                             st.error(f"Error al consultar Gemini: {e}")
 
