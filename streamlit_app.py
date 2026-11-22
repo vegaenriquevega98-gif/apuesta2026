@@ -1,4 +1,5 @@
 import math
+import time
 import difflib
 from datetime import datetime, timezone, timedelta
 import requests
@@ -79,6 +80,25 @@ def poisson_pmf(k: int, lam: float) -> float:
     if lam <= 0:
         return 1.0 if k == 0 else 0.0
     return (lam ** k) * math.exp(-lam) / math.factorial(k)
+
+
+def consultar_gemini(client: genai.Client, prompt: str, reintentos: int = 3) -> str:
+    ultimo_error = None
+    for intento in range(reintentos):
+        try:
+            resp = client.models.generate_content(
+                model=MODELO_GEMINI,
+                contents=prompt,
+            )
+            return resp.text
+        except Exception as e:
+            ultimo_error = e
+            texto_error = str(e)
+            es_temporal = ("503" in texto_error) or ("UNAVAILABLE" in texto_error) or ("429" in texto_error)
+            if es_temporal and intento < reintentos - 1:
+                time.sleep(2 * (intento + 1))
+                continue
+            raise ultimo_error
 
 
 def mapear_equipo(nombre_api: str, equipos_csv: list[str]) -> str | None:
@@ -390,13 +410,16 @@ with tab1:
             )
             with st.spinner("Calculando veredicto estadístico más probable..."):
                 try:
-                    resp = client.models.generate_content(
-                        model=MODELO_GEMINI,
-                        contents=f"{contexto_sistema}\n\nInstrucción:\n{prompt_dictamen}",
+                    respuesta = consultar_gemini(
+                        client,
+                        f"{contexto_sistema}\n\nInstrucción:\n{prompt_dictamen}",
                     )
-                    st.session_state["mensajes_ia"] = [{"role": "assistant", "content": resp.text}]
+                    st.session_state["mensajes_ia"] = [{"role": "assistant", "content": respuesta}]
                 except Exception as e:
-                    st.error(f"Error al consultar Gemini: {e}")
+                    if "503" in str(e) or "UNAVAILABLE" in str(e):
+                        st.warning("Los servidores de Gemini tienen alta demanda en este instante. Espera 5 segundos y vuelve a pulsar el botón.")
+                    else:
+                        st.error(f"Error al consultar Gemini: {e}")
 
         for msg in st.session_state["mensajes_ia"]:
             with st.chat_message(msg["role"]):
@@ -414,14 +437,17 @@ with tab1:
                         historial_chat = "\n".join(
                             [f"{m['role'].upper()}: {m['content']}" for m in st.session_state["mensajes_ia"]]
                         )
-                        resp = client.models.generate_content(
-                            model=MODELO_GEMINI,
-                            contents=f"{contexto_sistema}\n\nConversación previa:\n{historial_chat}",
+                        respuesta = consultar_gemini(
+                            client,
+                            f"{contexto_sistema}\n\nConversación previa:\n{historial_chat}",
                         )
-                        st.markdown(resp.text)
-                        st.session_state["mensajes_ia"].append({"role": "assistant", "content": resp.text})
+                        st.markdown(respuesta)
+                        st.session_state["mensajes_ia"].append({"role": "assistant", "content": respuesta})
                     except Exception as e:
-                        st.error(f"Error al consultar Gemini: {e}")
+                        if "503" in str(e) or "UNAVAILABLE" in str(e):
+                            st.warning("Los servidores de Gemini tienen alta demanda en este instante. Intenta enviar tu pregunta nuevamente en unos segundos.")
+                        else:
+                            st.error(f"Error al consultar Gemini: {e}")
 
 with tab2:
     fig_heat = go.Figure(
